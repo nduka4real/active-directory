@@ -38,9 +38,7 @@ Network	LDAP connectivity to a domain controller (TCP 389 / 636)
 Clone the repository:
 
 bash
-git clone https://github.com/nduka4real/AD-Management-Suite.git
-cd AD-Management-Suite
-Ensure the following files are in the same folder:
+
 
 text
 AD-Management-Suite/
