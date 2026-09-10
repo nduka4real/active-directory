@@ -1,0 +1,352 @@
+#requires -version 5.1
+<#
+.SYNOPSIS
+    GUI utility to configure AD DNS and join a Windows computer to an Active Directory domain.
+
+.NOTES
+    Run as Administrator.
+    Example:
+      Domain DNS: nduks.lab
+      AD DNS / Domain Controller IP: 192.168.1.10
+#>
+
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+
+$ErrorActionPreference = 'Stop'
+
+# -----------------------------
+# Elevate to Administrator
+# -----------------------------
+$principal = New-Object Security.Principal.WindowsPrincipal(
+    [Security.Principal.WindowsIdentity]::GetCurrent()
+)
+if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    $args = "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`""
+    Start-Process powershell.exe -Verb RunAs -ArgumentList $args
+    exit
+}
+
+$scriptRoot = Split-Path -Parent $PSCommandPath
+$logDir = Join-Path $scriptRoot "Logs"
+New-Item -ItemType Directory -Path $logDir -Force | Out-Null
+$logFile = Join-Path $logDir ("AD-Domain-Join-{0}.log" -f (Get-Date -Format "yyyyMMdd-HHmmss"))
+
+function Write-Log {
+    param([string]$Message)
+    $line = "[{0}] {1}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $Message
+    Add-Content -Path $logFile -Value $line
+}
+
+function Show-ErrorMessage {
+    param([string]$Message)
+    [System.Windows.Forms.MessageBox]::Show(
+        $Message, "Active Directory Domain Join",
+        [System.Windows.Forms.MessageBoxButtons]::OK,
+        [System.Windows.Forms.MessageBoxIcon]::Error
+    ) | Out-Null
+}
+
+function Get-ActiveAdapter {
+    $adapters = Get-NetAdapter -ErrorAction Stop |
+        Where-Object { $_.Status -eq 'Up' -and $_.HardwareInterface -eq $true } |
+        Sort-Object -Property ifIndex
+
+    if (-not $adapters) {
+        throw "No active physical network adapter was found."
+    }
+
+    # Prefer an adapter that currently has an IPv4 address.
+    foreach ($a in $adapters) {
+        $ip = Get-NetIPAddress -InterfaceIndex $a.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+            Where-Object { $_.IPAddress -notlike '169.254.*' }
+        if ($ip) { return $a }
+    }
+    return $adapters | Select-Object -First 1
+}
+
+function Test-IPv4 {
+    param([string]$IPAddress)
+    $parsed = $null
+    return [System.Net.IPAddress]::TryParse($IPAddress, [ref]$parsed) -and
+        $parsed.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetwork
+}
+
+function Test-DomainDns {
+    param(
+        [string]$Domain,
+        [string]$DnsServer
+    )
+
+    Write-Log "Testing DNS server $DnsServer for domain $Domain."
+
+    if (-not (Test-IPv4 $DnsServer)) {
+        throw "The AD DNS / Domain Controller IP is not a valid IPv4 address."
+    }
+
+    $ns = Resolve-DnsName -Name $Domain -Server $DnsServer -Type SOA -ErrorAction SilentlyContinue
+    if (-not $ns) {
+        # Try the AD LDAP SRV record, which is a stronger AD-specific check.
+        $srv = Resolve-DnsName -Name "_ldap._tcp.dc._msdcs.$Domain" -Server $DnsServer -Type SRV -ErrorAction SilentlyContinue
+        if (-not $srv) {
+            throw "DNS could not resolve the Active Directory domain or its LDAP SRV record using $DnsServer."
+        }
+    }
+
+    return $true
+}
+
+function Configure-ADDns {
+    param(
+        [int]$InterfaceIndex,
+        [string]$DnsServer
+    )
+
+    if (-not (Test-IPv4 $DnsServer)) {
+        throw "Invalid AD DNS server IPv4 address."
+    }
+
+    Write-Log "Configuring DNS on interface index $InterfaceIndex to $DnsServer."
+
+    # Preserve existing DNS as secondary where possible.
+    $current = Get-DnsClientServerAddress -InterfaceIndex $InterfaceIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue
+    $existing = @($current.ServerAddresses | Where-Object { $_ -and $_ -ne $DnsServer })
+
+    $servers = @($DnsServer) + $existing
+    $servers = @($servers | Select-Object -Unique)
+
+    # AD DNS should be primary. Keep at most 2 additional DNS servers.
+    if ($servers.Count -gt 3) { $servers = $servers[0..2] }
+
+    Set-DnsClientServerAddress -InterfaceIndex $InterfaceIndex -ServerAddresses $servers
+
+    ipconfig /flushdns | Out-Null
+    Write-Log "DNS configured as: $($servers -join ', ')"
+    return $servers
+}
+
+# -----------------------------
+# Build GUI
+# -----------------------------
+$form = New-Object System.Windows.Forms.Form
+$form.Text = "Active Directory Domain Join"
+$form.Size = New-Object System.Drawing.Size(650, 620)
+$form.StartPosition = "CenterScreen"
+$form.FormBorderStyle = "FixedDialog"
+$form.MaximizeBox = $false
+$form.MinimizeBox = $true
+$form.Font = New-Object System.Drawing.Font("Segoe UI", 10)
+
+$title = New-Object System.Windows.Forms.Label
+$title.Text = "Active Directory Domain Join"
+$title.Font = New-Object System.Drawing.Font("Segoe UI", 18, [System.Drawing.FontStyle]::Bold)
+$title.Location = New-Object System.Drawing.Point(25, 20)
+$title.AutoSize = $true
+$form.Controls.Add($title)
+
+$subtitle = New-Object System.Windows.Forms.Label
+$subtitle.Text = "Configure AD DNS, verify connectivity, and join this computer to the domain."
+$subtitle.Location = New-Object System.Drawing.Point(27, 58)
+$subtitle.Size = New-Object System.Drawing.Size(590, 40)
+$form.Controls.Add($subtitle)
+
+function Add-LabelAndTextBox {
+    param(
+        [string]$LabelText,
+        [int]$Y,
+        [string]$InitialValue = ""
+    )
+
+    $label = New-Object System.Windows.Forms.Label
+    $label.Text = $LabelText
+    $label.Location = New-Object System.Drawing.Point(30, $Y)
+    $label.AutoSize = $true
+    $form.Controls.Add($label)
+
+    $box = New-Object System.Windows.Forms.TextBox
+    $box.Location = New-Object System.Drawing.Point(30, ($Y + 25))
+    $box.Size = New-Object System.Drawing.Size(570, 30)
+    $box.Text = $InitialValue
+    $form.Controls.Add($box)
+
+    return $box
+}
+
+$domainBox = Add-LabelAndTextBox "Domain DNS Name (FQDN)" 105 "nduks.lab"
+$dnsBox    = Add-LabelAndTextBox "AD DNS / Domain Controller IPv4 Address" 175 ""
+$nameBox   = Add-LabelAndTextBox "Computer Name" 245 $env:COMPUTERNAME
+$ouBox     = Add-LabelAndTextBox "Target OU (optional)" 315 ""
+
+$adapterLabel = New-Object System.Windows.Forms.Label
+$adapterLabel.Text = "Network Adapter: Detecting..."
+$adapterLabel.Location = New-Object System.Drawing.Point(30, 390)
+$adapterLabel.Size = New-Object System.Drawing.Size(570, 25)
+$form.Controls.Add($adapterLabel)
+
+$statusLabel = New-Object System.Windows.Forms.Label
+$statusLabel.Text = "Status: Ready"
+$statusLabel.Location = New-Object System.Drawing.Point(30, 430)
+$statusLabel.Size = New-Object System.Drawing.Size(570, 55)
+$statusLabel.BorderStyle = "FixedSingle"
+$statusLabel.Padding = New-Object System.Windows.Forms.Padding(8)
+$form.Controls.Add($statusLabel)
+
+$configureButton = New-Object System.Windows.Forms.Button
+$configureButton.Text = "Configure DNS"
+$configureButton.Location = New-Object System.Drawing.Point(30, 500)
+$configureButton.Size = New-Object System.Drawing.Size(165, 38)
+$form.Controls.Add($configureButton)
+
+$testButton = New-Object System.Windows.Forms.Button
+$testButton.Text = "Test DNS"
+$testButton.Location = New-Object System.Drawing.Point(210, 500)
+$testButton.Size = New-Object System.Drawing.Size(165, 38)
+$form.Controls.Add($testButton)
+
+$joinButton = New-Object System.Windows.Forms.Button
+$joinButton.Text = "JOIN DOMAIN"
+$joinButton.Location = New-Object System.Drawing.Point(390, 500)
+$joinButton.Size = New-Object System.Drawing.Size(210, 38)
+$joinButton.Font = New-Object System.Drawing.Font("Segoe UI", 10, [System.Drawing.FontStyle]::Bold)
+$form.Controls.Add($joinButton)
+
+$adapter = $null
+try {
+    $adapter = Get-ActiveAdapter
+    $adapterLabel.Text = "Network Adapter: $($adapter.Name)  |  Index: $($adapter.ifIndex)"
+    Write-Log "Selected adapter: $($adapter.Name), index $($adapter.ifIndex)"
+} catch {
+    $adapterLabel.Text = "Network Adapter: ERROR - $($_.Exception.Message)"
+    Write-Log "Adapter detection failed: $($_.Exception.Message)"
+}
+
+function Set-Status {
+    param([string]$Text)
+    $statusLabel.Text = "Status: $Text"
+    $form.Refresh()
+}
+
+$configureButton.Add_Click({
+    try {
+        if (-not $adapter) { throw "No active network adapter is available." }
+        $dns = $dnsBox.Text.Trim()
+        if (-not (Test-IPv4 $dns)) { throw "Enter a valid IPv4 address for the AD DNS server." }
+
+        Set-Status "Configuring DNS..."
+        $servers = Configure-ADDns -InterfaceIndex $adapter.ifIndex -DnsServer $dns
+        Set-Status "DNS configured successfully. Primary DNS: $dns"
+        [System.Windows.Forms.MessageBox]::Show(
+            "DNS has been configured on:`n$($adapter.Name)`n`nDNS servers:`n$($servers -join "`n")",
+            "DNS Configuration Complete",
+            [System.Windows.Forms.MessageBoxButtons]::OK,
+            [System.Windows.Forms.MessageBoxIcon]::Information
+        ) | Out-Null
+    } catch {
+        Write-Log "DNS configuration failed: $($_.Exception.Message)"
+        Set-Status "DNS configuration failed."
+        Show-ErrorMessage $_.Exception.Message
+    }
+})
+
+$testButton.Add_Click({
+    try {
+        $domain = $domainBox.Text.Trim()
+        $dns = $dnsBox.Text.Trim()
+        if ([string]::IsNullOrWhiteSpace($domain)) { throw "Enter the AD domain DNS name." }
+        if (-not (Test-IPv4 $dns)) { throw "Enter a valid AD DNS server IPv4 address." }
+
+        Set-Status "Testing Active Directory DNS..."
+        Test-DomainDns -Domain $domain -DnsServer $dns | Out-Null
+        Set-Status "DNS test successful. Active Directory DNS records are reachable."
+        [System.Windows.Forms.MessageBox]::Show(
+            "DNS test successful.`n`nDomain: $domain`nAD DNS: $dns",
+            "DNS Test",
+            [System.Windows.Forms.MessageBoxButtons]::OK,
+            [System.Windows.Forms.MessageBoxIcon]::Information
+        ) | Out-Null
+    } catch {
+        Write-Log "DNS test failed: $($_.Exception.Message)"
+        Set-Status "DNS test failed."
+        Show-ErrorMessage $_.Exception.Message
+    }
+})
+
+$joinButton.Add_Click({
+    try {
+        if (-not $adapter) { throw "No active network adapter is available." }
+
+        $domain = $domainBox.Text.Trim()
+        $dns = $dnsBox.Text.Trim()
+        $computerName = $nameBox.Text.Trim()
+        $ou = $ouBox.Text.Trim()
+
+        if ([string]::IsNullOrWhiteSpace($domain)) { throw "Enter the AD domain DNS name." }
+        if (-not (Test-IPv4 $dns)) { throw "Enter a valid AD DNS server IPv4 address." }
+        if ([string]::IsNullOrWhiteSpace($computerName)) { throw "Enter a computer name." }
+
+        if ($computerName -notmatch '^[A-Za-z0-9][A-Za-z0-9\-]{0,14}$') {
+            throw "Computer name must be 1-15 characters and contain only letters, numbers, and hyphens."
+        }
+
+        $confirm = [System.Windows.Forms.MessageBox]::Show(
+            "This will configure DNS and join this computer to:`n`n$domain`n`nComputer name: $computerName`n`nContinue?",
+            "Confirm Domain Join",
+            [System.Windows.Forms.MessageBoxButtons]::YesNo,
+            [System.Windows.Forms.MessageBoxIcon]::Question
+        )
+        if ($confirm -ne [System.Windows.Forms.DialogResult]::Yes) { return }
+
+        Set-Status "Configuring AD DNS..."
+        Configure-ADDns -InterfaceIndex $adapter.ifIndex -DnsServer $dns | Out-Null
+
+        Set-Status "Testing AD DNS..."
+        Test-DomainDns -Domain $domain -DnsServer $dns | Out-Null
+
+        Set-Status "Requesting domain credentials..."
+        $credential = Get-Credential -Message "Enter an Active Directory account permitted to join computers to $domain" -UserName "$domain\Administrator"
+        if (-not $credential) {
+            Set-Status "Cancelled."
+            return
+        }
+
+        Write-Log "Starting domain join for $computerName to $domain."
+
+        Set-Status "Joining domain... This may take a moment."
+
+        $joinParams = @{
+            DomainName  = $domain
+            Credential  = $credential
+            Name        = $computerName
+            Force       = $true
+            ErrorAction = 'Stop'
+        }
+
+        if (-not [string]::IsNullOrWhiteSpace($ou)) {
+            $joinParams.OUPath = $ou
+        }
+
+        Add-Computer @joinParams
+
+        Write-Log "Domain join completed successfully."
+        Set-Status "SUCCESS: Computer joined to $domain."
+
+        $restart = [System.Windows.Forms.MessageBox]::Show(
+            "The computer successfully joined:`n$domain`n`nA restart is required before the domain account can be used.`n`nRestart now?",
+            "Domain Join Successful",
+            [System.Windows.Forms.MessageBoxButtons]::YesNo,
+            [System.Windows.Forms.MessageBoxIcon]::Information
+        )
+
+        if ($restart -eq [System.Windows.Forms.DialogResult]::Yes) {
+            Write-Log "Restarting computer after successful domain join."
+            Restart-Computer -Force
+        }
+    } catch {
+        Write-Log "Domain join failed: $($_.Exception.Message)"
+        Set-Status "DOMAIN JOIN FAILED."
+        Show-ErrorMessage ("Domain join failed:`n`n" + $_.Exception.Message + "`n`nSee the Logs folder for details.")
+    }
+})
+
+$form.Add_Shown({ $domainBox.Focus() })
+[void]$form.ShowDialog()
